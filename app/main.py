@@ -10,7 +10,8 @@ from . import service
 from .config import settings
 from .db import init_db
 from .errors import DomainError
-from .schemas import (CorrectionBatch, CorrectionItem, PackageRequest,
+from .schemas import (CorrectionBatch, CorrectionItem, CorrectionPreviewRequest,
+                      CorrectionPreviewSingle, PackageRequest,
                       ReleaseBatch, ReleaseItem, WithdrawalBatch,
                       WithdrawalItem)
 
@@ -63,6 +64,7 @@ def index() -> dict:
                 "GET  /api/v1/packages/{package_id}/review",
                 "POST /api/v1/releases",
                 "POST /api/v1/corrections",
+                "POST /api/v1/corrections/preview",
                 "POST /api/v1/withdrawals",
                 "GET  /api/v1/effective",
                 "GET  /api/v1/procedures/{number}/history",
@@ -100,6 +102,36 @@ async def create_correction(request: Request) -> dict:
     payload = await request.json()
     items = _coerce_items(payload, CorrectionItem, CorrectionBatch)
     return service.submit_corrections(items)
+
+
+@app.post("/api/v1/corrections/preview", status_code=200)
+async def preview_correction(request: Request) -> dict:
+    """更正批量预演（dry-run）：按输入顺序应用同批前项，逐项沿用正式更正的
+    全部校验与前置继承规则，但**不写版本、不占版本号、不改变历史**。
+
+    请求体在更正条目字段（单条对象或 ``{"items": [...]}``）之外，额外要求
+    非空作业区间 ``work_start < work_end``。全部合法时返回各项拟生成版本号、
+    最终前置清单，以及该作业区间内提交前后实际适用版本不同的最大片段与两侧
+    版本；任一项非法即按现有错误 code 返回该条 index，不给部分成功结果。
+    预演结果不保证随后可正式提交（正式提交仍按当时状态重新校验）。
+    """
+    payload = await request.json()
+    try:
+        if isinstance(payload, dict) and "items" in payload:
+            parsed = CorrectionPreviewRequest(**payload)
+            items = parsed.items
+        else:
+            single = CorrectionPreviewSingle(**payload)
+            items = [CorrectionItem(
+                number=single.number, base_revision=single.base_revision,
+                valid_start=single.valid_start, valid_end=single.valid_end,
+                body=single.body, prerequisites=single.prerequisites)]
+            work_start, work_end = single.work_start, single.work_end
+            return service.preview_corrections(work_start, work_end, items)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors())
+    return service.preview_corrections(
+        parsed.work_start, parsed.work_end, items)
 
 
 @app.post("/api/v1/withdrawals", status_code=201)

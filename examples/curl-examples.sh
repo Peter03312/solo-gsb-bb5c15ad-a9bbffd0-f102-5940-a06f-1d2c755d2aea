@@ -477,3 +477,129 @@ curl -sS -i --get "$BASE_URL/api/v1/procedures/SOP-PRE-001/closure-plan" \
   --data-urlencode 'work_end=2027-01-01T00:00:00Z'; echo
 curl -sS -i --get "$BASE_URL/api/v1/procedures/SOP-PRE-001/closure-plan" \
   --data-urlencode 'work_start=2026-01-01T00:00:00Z'; echo
+
+# ------------------------------------------------------------------------
+# 更正批量预演（本轮新增）：正式提交多条更正前，按现有单条/批量更正字段
+# 预演整批结果，必须指定非空作业区间。按输入顺序应用同批前项（后项可引用
+# 前项拟生成的版本），逐项沿用剩余区间/重叠/正文/前置编号的校验与省略
+# 继承规则。全程只读：不写版本、不占版本号、不改变历史。
+# ------------------------------------------------------------------------
+
+# 前置规程
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PV-PRE",
+        "body": "预演示例的前置规程。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }'; echo
+
+# --- 35. 发布全年适用的根规程（携带前置） ----------------------------------
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PV-001",
+        "body": "初版正文：进入车间必须佩戴护目镜。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-PV-PRE"]
+      }'; echo
+
+# --- 36. 整批预演（200）：链式拟生成 r1/r2，省略继承 / 显式清空前置，
+#        返回各项拟生成版本号、最终前置清单与全年区间内提交前后的最大片段 ----
+curl -sS -X POST "$BASE_URL/api/v1/corrections/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end":   "2027-01-01T00:00:00Z",
+        "items": [
+          {"number": "SOP-PV-001", "base_revision": 0,
+           "valid_start": "2026-03-01T00:00:00Z",
+           "valid_end":   "2026-05-01T00:00:00Z",
+           "body": "拟生成 r1（省略 prerequisites -> 继承 r0 的列表）"},
+          {"number": "SOP-PV-001", "base_revision": 1,
+           "valid_start": "2026-03-10T00:00:00Z",
+           "valid_end":   "2026-03-20T00:00:00Z",
+           "body": "拟生成 r2（以同批前项 r1 为基版）",
+           "prerequisites": []}
+        ]
+      }'; echo
+
+# --- 37. 预演不写版本、不占号：历史仍只有 r0 -------------------------------
+curl -sS "$BASE_URL/api/v1/procedures/SOP-PV-001/history"; echo
+
+# --- 38. 预演合法后正式提交：revision 仍为 1（预演未占号） ------------------
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PV-001", "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-05-01T00:00:00Z",
+        "body": "正式 r1"
+      }'; echo
+
+# --- 39a. 同批条目重叠 -> 409 concurrent_correction_conflict（index=1） -----
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end":   "2027-01-01T00:00:00Z",
+        "items": [
+          {"number": "SOP-PV-001", "base_revision": 0,
+           "valid_start": "2026-06-01T00:00:00Z",
+           "valid_end":   "2026-07-01T00:00:00Z", "body": "第一条"},
+          {"number": "SOP-PV-001", "base_revision": 0,
+           "valid_start": "2026-06-10T00:00:00Z",
+           "valid_end":   "2026-06-20T00:00:00Z", "body": "与第一条重叠"}
+        ]
+      }'; echo
+
+# --- 39b. 编号不存在 -> 404 not_found（带 index） ---------------------------
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end":   "2027-01-01T00:00:00Z",
+        "items": [
+          {"number": "SOP-PV-NOPE", "base_revision": 0,
+           "valid_start": "2026-06-01T00:00:00Z",
+           "valid_end":   "2026-07-01T00:00:00Z", "body": "x"}
+        ]
+      }'; echo
+
+# --- 39c. 空作业区间 -> 422 invalid_interval；缺时区 -> 422 invalid_time ----
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "work_start": "2026-05-01T00:00:00Z",
+        "work_end":   "2026-05-01T00:00:00Z",
+        "items": [
+          {"number": "SOP-PV-001", "base_revision": 0,
+           "valid_start": "2026-06-01T00:00:00Z",
+           "valid_end":   "2026-07-01T00:00:00Z", "body": "x"}
+        ]
+      }'; echo
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "work_start": "2026-01-01T00:00:00",
+        "work_end":   "2027-01-01T00:00:00Z",
+        "items": [
+          {"number": "SOP-PV-001", "base_revision": 0,
+           "valid_start": "2026-06-01T00:00:00Z",
+           "valid_end":   "2026-07-01T00:00:00Z", "body": "x"}
+        ]
+      }'; echo
+
+# --- 40. 单条对象形式：更正字段与作业区间并列 -------------------------------
+curl -sS -X POST "$BASE_URL/api/v1/corrections/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PV-001", "base_revision": 0,
+        "valid_start": "2026-10-01T00:00:00Z",
+        "valid_end":   "2026-11-01T00:00:00Z",
+        "body": "单条预演",
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end":   "2027-01-01T00:00:00Z"
+      }'; echo

@@ -31,6 +31,15 @@
 - 父版本的"仍生效区间" = 自身区间 − 其全部**当前仍生效**（未撤回）子更正区间；
 - 查询时在所有可见候选中沿 supersedes 链取"最深"版本，即为作业时刻有效正文。
 
+更正预演（dry-run）
+-------------------
+正式提交多条更正前可整批预演（:func:`preview_corrections`）：拟生成版本只
+存在于内存（:class:`_SimVersion`，负数临时 id），按输入顺序逐项复用正式
+更正的同一套校验（含同批同基版并发冲突、扣除已发布与同批拟生成子更正后的
+剩余区间、省略继承前置）；合法时逐规程比较"真实版本"与"真实版本 + 拟生成
+版本"在指定非空作业区间内的实际适用版本，返回不同的最大片段。全程只读、
+不写版本、不占版本号、不改变历史；正式提交仍按当时状态重新校验。
+
 作业规程包
 ----------
 班组开工前按（作业时刻、知悉时刻、一组规程编号）固定一个不可变快照：
@@ -434,6 +443,283 @@ def submit_corrections(items: list) -> dict:
                             "prerequisites": prerequisites})
 
     return {"published_at": published_at, "items": created}
+
+# ---------------------------------------------------------------- 更正预演（dry-run）
+
+
+class _SimVersion:
+    """预演期间拟生成的版本（仅存内存，绝不落库）。
+
+    按命名属性访问，字段与 ``sqlite3.Row`` 上的版本行对齐（id / procedure_id /
+    revision / body / valid_start / valid_end / supersedes_id），使 :func:`_depth_of`
+    等链上工具对真实行与拟生成版本一视同仁；``prerequisites`` 携带该拟生成版本
+    最终落库后的前置编号列表（省略时已解析为继承结果）。预演 id 取负数，永远不
+    会与真实行 id（正整数）碰撞。
+    """
+
+    def __init__(self, sim_id: int, proc_id: int, revision: int, body: str,
+                 valid_start: str, valid_end: str, supersedes_id: int,
+                 number: str, prerequisites: list[str]):
+        self.id = sim_id
+        self.procedure_id = proc_id
+        self.revision = revision
+        self.body = body
+        self.valid_start = valid_start
+        self.valid_end = valid_end
+        self.supersedes_id = supersedes_id
+        self.number = number
+        self.prerequisites = prerequisites
+
+    def __getitem__(self, key: str):
+        """同时支持 ``row["field"]``（sqlite3.Row 形状）与属性访问。"""
+        return getattr(self, key)
+
+
+def _find_version(real_versions: list[sqlite3.Row],
+                  sim_versions: list[_SimVersion],
+                  proc_id: int, revision: int):
+    """按 (规程, 版本号) 取版本：同批拟生成版本优先于真实历史版本。"""
+    for v in sim_versions:
+        if v.procedure_id == proc_id and v.revision == revision:
+            return v
+    for v in real_versions:
+        if v["procedure_id"] == proc_id and v["revision"] == revision:
+            return v
+    return None
+
+
+def _sim_children(real_versions: list[sqlite3.Row],
+                  sim_versions: list[_SimVersion],
+                  parent_id: int):
+    """某版本当前全部子更正（真实行 + 同批拟生成版本，按起点排序）。"""
+    out = [v for v in real_versions if v["supersedes_id"] == parent_id]
+    out.extend(v for v in sim_versions if v.supersedes_id == parent_id)
+    out.sort(key=lambda v: v["valid_start"])
+    return out
+
+
+def _sim_remaining(real_versions: list[sqlite3.Row],
+                   sim_versions: list[_SimVersion],
+                   withdrawn: dict[int, str], base) -> list[tuple[str, str]]:
+    """预演视角下基版的"仍生效区间"：自身区间 − 其全部当前仍生效子更正。
+
+    与正式提交的 :func:`_remaining` 同构，但扣除对象额外包含同批前项拟生成的
+    子更正，而已撤回的真实子更正（id 在 withdrawn 中）不占用区间；拟生成版本
+    不可能被撤回。
+    """
+    holes = [(c["valid_start"], c["valid_end"])
+             for c in _sim_children(real_versions, sim_versions, base["id"])
+             if not (not isinstance(c, _SimVersion) and c["id"] in withdrawn)]
+    return _subtract_intervals((base["valid_start"], base["valid_end"]), holes)
+
+
+def _preview_diff_for_proc(work_start: str, work_end: str,
+                           real_rows: list[sqlite3.Row],
+                           sim_versions: list[_SimVersion]
+                           ) -> list[dict]:
+    """单个规程：比较提交前后（真实行 vs 真实行+拟生成版本）在作业区间内的
+    实际适用版本，返回两侧版本不同的最大片段（左闭右开、合并相邻同态片段）。
+
+    两侧可见性均按"当下"（now 知悉时刻）取——预演只推演更正叠加效果，不涉及
+    发布/撤回时刻；调用方保证 ``real_rows`` 仅含未撤回版本（两侧均可见）。
+    拟生成版本只出现在"提交后"一侧，其父版本恒在候选并集中。
+    """
+    before_rows = real_rows
+    after_rows = real_rows + sim_versions
+    all_versions: dict[int, object] = {v["id"]: v for v in before_rows}
+    for v in after_rows:
+        all_versions.setdefault(v["id"], v)
+    depth_cache: dict[int, int] = {}
+
+    bounds = {work_start, work_end}
+    for v in all_versions.values():
+        if v["valid_end"] <= work_start or work_end <= v["valid_start"]:
+            continue                                # 与作业区间不相交
+        bounds.add(max(v["valid_start"], work_start))
+        bounds.add(min(v["valid_end"], work_end))
+    ordered = sorted(bounds)
+
+    raw: list[tuple[str, str, int | None, int | None]] = []
+    for s, e in zip(ordered, ordered[1:]):
+        lv = _effective_at(s, before_rows, all_versions, depth_cache)
+        rv = _effective_at(s, after_rows, all_versions, depth_cache)
+        raw.append((s, e, lv["id"] if lv is not None else None,
+                    rv["id"] if rv is not None else None))
+
+    segments: list[dict] = []
+    for s, e, lid, rid in _merge_adjacent(raw):
+        if lid == rid:
+            continue
+        lv = all_versions.get(lid) if lid is not None else None
+        rv = all_versions.get(rid) if rid is not None else None
+        segments.append({
+            "start": s,
+            "end": e,
+            "before": None if lv is None else {
+                "revision": lv["revision"], "body": lv["body"]},
+            "after": None if rv is None else {
+                "revision": rv["revision"], "body": rv["body"]},
+        })
+    return segments
+
+
+def preview_corrections(work_start_raw: str, work_end_raw: str,
+                        items: list) -> dict:
+    """值班员提交多条更正前的整批预演（dry-run，全程只读）。
+
+    * 按**输入顺序**逐项应用同批前项：后项可引用前项拟生成的版本（版本号为
+      可预知的该规程当前最大号 +1，同批内逐号递增）；
+    * 逐项沿用与 :func:`submit_corrections` 完全相同的校验与继承规则——编号/
+      基版存在性、子区间落在基版区间内、基版未撤回、同批同基版区间不得重叠、
+      子区间落在当前基版剩余区间（已扣除已发布子更正与同批前项拟生成更正）、
+      前置列表形状校验与省略继承/显式清空；
+    * 任一项非法即按现有 code/http 状态抛出（details 带该条 index），不返回
+      部分成功结果；
+    * 全部合法时返回各项拟生成版本号、最终前置清单，以及指定**非空作业区间**
+      内提交前后实际适用版本不同的最大片段与两侧版本（只看版本号）。
+
+    预演不写版本、不占版本号、不改变历史；随后正式提交仍须按当时状态重新
+    校验，预演结果不保证可提交（并发更正/撤回可能在此期间改变状态）。
+    """
+    # 作业区间先于一切条目校验（与对比接口一致：非法区间直接 422、不碰数据）。
+    try:
+        work_start = parse_canonical(work_start_raw, "work_start")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "work_start"})
+    try:
+        work_end = parse_canonical(work_end_raw, "work_end")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "work_end"})
+    if not work_start < work_end:
+        raise errors.invalid_interval(
+            work_start, work_end,
+            "作业区间非法：work_start 必须严格早于 work_end（区间为 [起, 止) 且长度大于 0）")
+
+    with read_snapshot() as conn:
+        withdrawn_all = _withdrawn_map(conn)  # 已撤回版本在两侧都不参与适用判定
+
+        # 规程按需懒加载：proc_id -> (proc 行, 该规程全部真实版本行)
+        real_by_proc: dict[int, list[sqlite3.Row]] = {}
+
+        def load_proc(proc: sqlite3.Row) -> None:
+            rows = conn.execute(
+                "SELECT * FROM versions WHERE procedure_id = ?",
+                (proc["id"],)).fetchall()
+            real_by_proc[proc["id"]] = list(rows)
+
+        # (proc_id, base_revision) -> 同批已接受的拟生成子区间
+        pending: dict[tuple[int, int], list[tuple[str, str]]] = {}
+        sim_by_proc: dict[int, list[_SimVersion]] = {}
+        previewed: list[dict] = []
+        touched_ids: list[int] = []             # 首次涉及顺序（去重）
+        number_by_proc: dict[int, str] = {}
+        next_sim_id = -1
+
+        for i, item in enumerate(items):
+            number = _clean_number(item.number, i)
+            body = _clean_text(item.body, "body", i)
+            sub = _validated_interval(item.valid_start, item.valid_end, i)
+            # 省略 -> 继承被替代版本；显式空列表 -> 清空（与正式提交同一函数）
+            prerequisites = _clean_prerequisites(
+                getattr(item, "prerequisites", None), i)
+
+            proc = _fetch_procedure(conn, number)
+            if proc is None:
+                raise errors.procedure_not_found(number, i)
+            proc_id = proc["id"]
+            if proc_id not in real_by_proc:
+                load_proc(proc)
+            real_versions = real_by_proc[proc_id]
+            sim_versions = sim_by_proc.setdefault(proc_id, [])
+
+            base = _find_version(real_versions, sim_versions,
+                                 proc_id, item.base_revision)
+            if base is None:
+                raise errors.base_version_not_found(number, item.base_revision, i)
+
+            # 1) 子区间必须整体落在基版区间内（非法区间优先于冲突判定）。
+            base_iv = (base["valid_start"], base["valid_end"])
+            if not (base_iv[0] <= sub[0] and sub[1] <= base_iv[1]):
+                raise errors.invalid_interval(
+                    sub[0], sub[1],
+                    f"非法区间：更正子区间 [{sub[0]}, {sub[1]}) 超出被替代版本 "
+                    f"r{item.base_revision} 的适用区间 [{base_iv[0]}, {base_iv[1]})",
+                    i)
+
+            # 1.5) 基版已撤回（仅真实版本可能已撤回）不能作为被替代版本。
+            base_id = base["id"]
+            if base_id in withdrawn_all:
+                raise errors.base_version_withdrawn(
+                    number, item.base_revision, withdrawn_all[base_id], i)
+
+            # 2) 同批对同一被替代版本的子区间不得相互重叠（先于剩余区间检查，
+            #    与正式提交一致：对同批前项的重叠属并发更正冲突）。
+            key = (proc_id, item.base_revision)
+            clash = _first_overlap(sub, pending.get(key, []))
+            if clash is not None:
+                raise errors.concurrent_conflict(number, item.base_revision,
+                                                 clash, i)
+
+            # 3) 扣除已发布子更正与同批前项拟生成更正后的剩余生效区间。
+            remaining = _sim_remaining(real_versions, sim_versions,
+                                       withdrawn_all, base)
+            if not _covered_by(sub, remaining):
+                raise errors.expired_base(number, item.base_revision,
+                                          remaining, i)
+
+            # 拟生成版本号：该规程真实最大号与同批拟生成号之后的下一号。
+            max_real = max((v["revision"] for v in real_versions), default=-1)
+            max_sim = max((v.revision for v in sim_versions), default=-1)
+            new_revision = max(max_real, max_sim) + 1
+
+            if prerequisites is None:
+                # 省略继承：基版为真实行则读库，基版为同批拟生成版本则取其
+                # 已解析好的最终列表。
+                if isinstance(base, _SimVersion):
+                    prerequisites = list(base.prerequisites)
+                else:
+                    prerequisites = _prerequisites_of(conn, base["id"])
+
+            sim = _SimVersion(next_sim_id, proc_id, new_revision, body,
+                              sub[0], sub[1], base_id, number, prerequisites)
+            next_sim_id -= 1
+            sim_versions.append(sim)
+            pending.setdefault(key, []).append(sub)
+            previewed.append({
+                "index": i,
+                "number": number,
+                "revision": new_revision,
+                "supersedes_revision": item.base_revision,
+                "body": body,
+                "valid_start": sub[0],
+                "valid_end": sub[1],
+                "prerequisites": prerequisites,
+            })
+            if proc_id not in touched_ids:
+                touched_ids.append(proc_id)
+                number_by_proc[proc_id] = number
+
+        # 全部合法：逐规程比较提交前后在指定作业区间内的实际适用版本。
+        changes: list[dict] = []
+        for proc_id in touched_ids:
+            real_visible = [v for v in real_by_proc[proc_id]
+                            if v["id"] not in withdrawn_all]
+            segments = _preview_diff_for_proc(
+                work_start, work_end, real_visible,
+                sim_by_proc.get(proc_id, []))
+            changes.append({"number": number_by_proc[proc_id],
+                            "count": len(segments),
+                            "segments": segments})
+
+    return {"work_start": work_start,
+            "work_end": work_end,
+            "count": len(previewed),
+            "items": previewed,
+            "changes_count": sum(p["count"] for p in changes),
+            "changes": changes}
+
 
 # ---------------------------------------------------------------- 更正撤回
 

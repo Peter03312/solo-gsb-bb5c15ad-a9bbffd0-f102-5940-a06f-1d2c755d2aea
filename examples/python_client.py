@@ -128,6 +128,116 @@ def main() -> None:
     # 13) 跨时段前置规程清单：逐片段判断全作业区间的持续可用性
     _closure_plan_examples()
 
+    # 14) 更正批量预演：提交前按现有字段推演整批结果（不写版本、不占号）
+    _preview_examples()
+
+
+def _preview_examples() -> None:
+    """更正批量预演：整批 dry-run，返回拟生成版本号、最终前置清单与提交前后
+    指定作业区间内实际适用版本不同的最大片段；预演不写任何历史。"""
+    number = "SOP-DEMO-PV-001"
+    call("POST", "/api/v1/releases", {
+        "number": number,
+        "body": "初版正文：进入车间必须佩戴护目镜。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-DEMO-PV-PRE"],
+    })
+
+    def pv(items,
+           ws="2026-01-01T00:00:00Z", we="2027-01-01T00:00:00Z"):
+        return call("POST", "/api/v1/corrections/preview",
+                    {"work_start": ws, "work_end": we, "items": items})
+
+    # 14.1) 链式整批预演：后项引用前项"拟生成"的 r1；省略继承、显式替换前置
+    status, res = pv([
+        {"number": number, "base_revision": 0,
+         "valid_start": "2026-03-01T00:00:00Z",
+         "valid_end": "2026-05-01T00:00:00Z",
+         "body": "拟生成 r1：3-4 月（省略前置 -> 继承 r0 的列表）"},
+        {"number": number, "base_revision": 1,
+         "valid_start": "2026-03-10T00:00:00Z",
+         "valid_end": "2026-03-20T00:00:00Z",
+         "body": "拟生成 r2：以同批前项 r1 为基版",
+         "prerequisites": []},
+    ])
+    show("14.1 整批预演（拟生成 r1/r2、继承/清空前置、提交前后最大片段）",
+         status, res)
+
+    # 14.2) 预演不写版本、不占版本号：历史仍只有 r0
+    status, res = call("GET", f"/api/v1/procedures/{number}/history")
+    show("14.2 预演后历史（仍只有 r0，未占号）", status,
+         {"count": res["count"],
+          "revisions": [v["revision"] for v in res["items"]]})
+
+    # 14.3) 预演合法后再正式提交：版本号从 1 开始，且可只提交其中一条
+    status, res = call("POST", "/api/v1/corrections", {
+        "number": number, "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end": "2026-05-01T00:00:00Z",
+        "body": "正式 r1（与预演 r1 同号，说明预演不占号）",
+    })
+    show("14.3 正式提交（revision 仍为 1）", status, res)
+
+    # 14.4) 非法条目：指出位置（index）与现有错误原因，不返回部分成功结果
+    status, res = pv([
+        {"number": number, "base_revision": 0,
+         "valid_start": "2026-06-01T00:00:00Z",
+         "valid_end": "2026-07-01T00:00:00Z", "body": "合法第一条"},
+        {"number": number, "base_revision": 0,
+         "valid_start": "2026-06-10T00:00:00Z",
+         "valid_end": "2026-06-20T00:00:00Z",
+         "body": "与第一条重叠的第二条（整批拒绝、index=1）"},
+    ])
+    show("14.4a 同批重叠 -> 409 concurrent_correction_conflict（带 index）",
+         status, res)
+    status, res = pv([
+        {"number": "SOP-DEMO-PV-NOPE", "base_revision": 0,
+         "valid_start": "2026-06-01T00:00:00Z",
+         "valid_end": "2026-07-01T00:00:00Z", "body": "编号不存在"},
+    ])
+    show("14.4b 编号不存在 -> 404 not_found（带 index）", status, res)
+    status, res = pv([
+        {"number": number, "base_revision": 0,
+         "valid_start": "2026-09-01T00:00:00Z",
+         "valid_end": "2026-08-01T00:00:00Z", "body": "倒置区间"},
+    ])
+    show("14.4c 子区间倒置 -> 422 invalid_interval", status, res)
+
+    # 14.5) 作业区间非法（必须非空）/ 缺时区：直接 422
+    status, res = pv([
+        {"number": number, "base_revision": 0,
+         "valid_start": "2026-06-01T00:00:00Z",
+         "valid_end": "2026-07-01T00:00:00Z", "body": "x"}],
+        ws="2026-05-01T00:00:00Z", we="2026-05-01T00:00:00Z")
+    show("14.5a 空作业区间 -> 422 invalid_interval", status, res)
+    status, res = call("POST", "/api/v1/corrections/preview", {
+        "work_start": "2026-01-01T00:00:00",
+        "work_end": "2027-01-01T00:00:00Z",
+        "items": [{"number": number, "base_revision": 0,
+                   "valid_start": "2026-06-01T00:00:00Z",
+                   "valid_end": "2026-07-01T00:00:00Z", "body": "x"}]})
+    show("14.5b 作业时刻缺时区 -> 422 invalid_time", status, res)
+
+    # 14.6) 作业区间与更正区间不相交：批次合法，但 changes 为空
+    status, res = pv([
+        {"number": number, "base_revision": 0,
+         "valid_start": "2026-06-01T00:00:00Z",
+         "valid_end": "2026-07-01T00:00:00Z", "body": "6 月更正"}],
+        ws="2026-08-01T00:00:00Z", we="2026-09-01T00:00:00Z")
+    show("14.6 作业区间外的更正（changes_count=0）", status, res)
+
+    # 14.7) 单条形式：更正字段与作业区间并列（无需 items 包装）
+    status, res = call("POST", "/api/v1/corrections/preview", {
+        "number": number, "base_revision": 0,
+        "valid_start": "2026-10-01T00:00:00Z",
+        "valid_end": "2026-11-01T00:00:00Z",
+        "body": "单条预演",
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+    })
+    show("14.7 单条对象形式预演", status, res)
+
 
 def _withdrawal_examples() -> None:
     """撤回示例：撤回只追加事件，撤回前历史不变，撤回后区间恢复父版本正文。"""

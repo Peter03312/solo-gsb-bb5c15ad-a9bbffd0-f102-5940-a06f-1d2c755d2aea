@@ -44,6 +44,32 @@ class CorrectionBatch(StrictModel):
     items: list[CorrectionItem]
 
 
+class CorrectionPreviewRequest(StrictModel):
+    """更正批量预演：同字段的更正条目（单条或 items 批量）+ 非空作业区间。
+
+    预演全程只读：不写版本、不占版本号、不改变历史。
+    """
+    work_start: str = Field(..., description="作业区间起点（含），ISO-8601 带时区")
+    work_end: str = Field(..., description="作业区间终点（不含），必须严格晚于起点")
+    items: list[CorrectionItem] = Field(
+        ..., min_length=1, description="按顺序应用的更正条目（至少 1 条）")
+
+
+class CorrectionPreviewSingle(StrictModel):
+    """单条更正预演：CorrectionItem 字段 + 非空作业区间。"""
+    work_start: str = Field(..., description="作业区间起点（含），ISO-8601 带时区")
+    work_end: str = Field(..., description="作业区间终点（不含），必须严格晚于起点")
+    number: str = Field(..., description="规程编号")
+    base_revision: int = Field(..., ge=0, description="被替代版本号（首版为 0）")
+    valid_start: str = Field(..., description="子区间起点（含），ISO-8601 带时区")
+    valid_end: str = Field(..., description="子区间终点（不含），ISO-8601 带时区")
+    body: str = Field(..., description="新正文（仅覆盖该子区间）")
+    prerequisites: list[str] | None = Field(
+        default=None,
+        description="前置规程编号列表（不得含空白或重复编号）；"
+                    "省略继承被替代版本的列表，显式空列表表示清空")
+
+
 class WithdrawalItem(StrictModel):
     number: str = Field(..., description="规程编号")
     revision: int = Field(..., ge=0, description="待撤回的更正版本号（首版 0 不可撤回）")
