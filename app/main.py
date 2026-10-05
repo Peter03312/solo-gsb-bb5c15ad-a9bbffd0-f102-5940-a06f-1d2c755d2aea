@@ -10,7 +10,8 @@ from . import service
 from .config import settings
 from .db import init_db
 from .errors import DomainError
-from .schemas import (CorrectionBatch, CorrectionItem, PackageRequest,
+from .schemas import (CorrectionBatch, CorrectionItem, CorrectionPreviewBatch,
+                      CorrectionPreviewItem, PackageRequest,
                       ReleaseBatch, ReleaseItem, WithdrawalBatch,
                       WithdrawalItem)
 
@@ -19,8 +20,9 @@ app = FastAPI(
     version="1.0.0",
     description=("双时间维（适用时间 / 发布时间）规程版本库：首次发布、更正、"
                  "误发布更正的撤回（只追加事件）、按作业时刻+知悉时刻回溯查询、"
-                 "两知悉时刻区间对比、作业规程包的固定/取回/复核，以及前置规程"
-                 "清单的递归解析（单时刻闭包与跨时段作业区间的逐片段可用性）。"),
+                 "两知悉时刻区间对比、作业规程包的固定/取回/复核、前置规程"
+                 "清单的递归解析（单时刻闭包与跨时段作业区间的逐片段可用性），"
+                 "以及多条更正正式提交前的只读批量预演（不写历史、不占版本号）。"),
 )
 
 
@@ -63,6 +65,7 @@ def index() -> dict:
                 "GET  /api/v1/packages/{package_id}/review",
                 "POST /api/v1/releases",
                 "POST /api/v1/corrections",
+                "POST /api/v1/corrections/preview",
                 "POST /api/v1/withdrawals",
                 "GET  /api/v1/effective",
                 "GET  /api/v1/procedures/{number}/history",
@@ -100,6 +103,35 @@ async def create_correction(request: Request) -> dict:
     payload = await request.json()
     items = _coerce_items(payload, CorrectionItem, CorrectionBatch)
     return service.submit_corrections(items)
+
+
+@app.post("/api/v1/corrections/preview", status_code=200)
+async def preview_correction(request: Request) -> dict:
+    """更正批量预演：正式提交前按现有单条/批量更正字段预演整批结果。
+
+    请求体支持单条对象（自身带 work_start/work_end），或
+    ``{"work_start": ..., "work_end": ..., "items": [...]}`` 批量。
+    预演在只读快照的内存副本上按与正式提交相同的规则逐项应用（同批按输入
+    顺序、后项可引用前项拟生成版本），返回各项拟生成版本号、最终前置清单，
+    以及指定非空作业区间内提交前后实际适用版本不同的最大片段。预演不写
+    版本、不占版本号、不改变历史；任一项非法即指出位置（details.index）与
+    现有错误原因，不返回部分成功结果。
+    """
+    payload = await request.json()
+    items, work_start, work_end = _coerce_preview(payload)
+    return service.preview_corrections(items, work_start, work_end)
+
+
+def _coerce_preview(payload: dict) -> tuple[list, str, str]:
+    """解析预演请求：单条对象（自带作业区间）或带 items 的批量对象。"""
+    try:
+        if isinstance(payload, dict) and "items" in payload:
+            batch = CorrectionPreviewBatch(**payload)
+            return batch.items, batch.work_start, batch.work_end
+        single = CorrectionPreviewItem(**payload)
+        return [single], single.work_start, single.work_end
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors())
 
 
 @app.post("/api/v1/withdrawals", status_code=201)

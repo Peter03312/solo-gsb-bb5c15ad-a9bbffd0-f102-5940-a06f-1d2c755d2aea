@@ -477,3 +477,118 @@ curl -sS -i --get "$BASE_URL/api/v1/procedures/SOP-PRE-001/closure-plan" \
   --data-urlencode 'work_end=2027-01-01T00:00:00Z'; echo
 curl -sS -i --get "$BASE_URL/api/v1/procedures/SOP-PRE-001/closure-plan" \
   --data-urlencode 'work_start=2026-01-01T00:00:00Z'; echo
+
+# ------------------------------------------------------------------------
+# 更正批量预演（本轮新增，只读）：正式提交前按单条/批量同一套字段预演整批
+# 结果，须指定非空作业区间。同批按输入顺序应用，后项可引用前项拟生成版本；
+# 返回各项拟生成版本号、最终前置清单，以及作业区间内提交前后实际适用版本
+# 不同的最大片段。预演不写版本、不占版本号、不改变历史；预演结果不保证
+# 可提交（正式提交仍按当时状态重新校验）。
+# 数据：SOP-PRE-001 初版 r0 已发布（前置 [101,102]，3 月已发布 r1）。
+# ------------------------------------------------------------------------
+
+# --- 35a. 批量预演：r0->r2（9 月），再以同批拟生成的 r2 为基版 r2->r3 ------
+#        省略前置 -> 继承基版列表；全年作业区间给出提交前后差异最大片段
+curl -sS -X POST "$BASE_URL/api/v1/corrections/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end":   "2027-01-01T00:00:00Z",
+        "items": [
+          {"number": "SOP-PRE-001", "base_revision": 0,
+           "valid_start": "2026-09-01T00:00:00Z",
+           "valid_end":   "2026-10-01T00:00:00Z",
+           "body": "九月更正（省略前置，继承基版）。"},
+          {"number": "SOP-PRE-001", "base_revision": 2,
+           "valid_start": "2026-09-10T00:00:00Z",
+           "valid_end":   "2026-09-20T00:00:00Z",
+           "body": "对同批拟生成 r2 的再更正。",
+           "prerequisites": ["SOP-PRE-101"]}
+        ]
+      }'; echo
+
+# --- 35b. 单条对象形式：作业区间随条目给出 -------------------------------
+curl -sS -X POST "$BASE_URL/api/v1/corrections/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PRE-001", "base_revision": 0,
+        "valid_start": "2026-07-01T00:00:00Z",
+        "valid_end":   "2026-08-01T00:00:00Z",
+        "body": "七月更正（显式清空前置）。",
+        "prerequisites": [],
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end":   "2027-01-01T00:00:00Z"
+      }'; echo
+
+# --- 35c. 预演只读：版本历史不变（不会因预演多出版本） -------------------
+curl -sS "$BASE_URL/api/v1/procedures/SOP-PRE-001/history"; echo
+
+# --- 36a. 第 2 条编号不存在 -> 404 not_found，details.index=1 -------------
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end":   "2027-01-01T00:00:00Z",
+        "items": [
+          {"number": "SOP-PRE-001", "base_revision": 0,
+           "valid_start": "2026-11-01T00:00:00Z",
+           "valid_end":   "2026-12-01T00:00:00Z", "body": "第 1 条合法"},
+          {"number": "SOP-PRE-GONE", "base_revision": 0,
+           "valid_start": "2026-11-01T00:00:00Z",
+           "valid_end":   "2026-12-01T00:00:00Z", "body": "第 2 条编号不存在"}
+        ]
+      }'; echo
+
+# --- 36b. 同批对同一基版的子区间重叠 -> 409 concurrent_correction_conflict
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end":   "2027-01-01T00:00:00Z",
+        "items": [
+          {"number": "SOP-PRE-001", "base_revision": 0,
+           "valid_start": "2026-11-01T00:00:00Z",
+           "valid_end":   "2026-11-20T00:00:00Z", "body": "并发更正 A"},
+          {"number": "SOP-PRE-001", "base_revision": 0,
+           "valid_start": "2026-11-10T00:00:00Z",
+           "valid_end":   "2026-11-30T00:00:00Z", "body": "并发更正 B（与 A 冲突）"}
+        ]
+      }'; echo
+
+# --- 36c. 落在已发布更正覆盖处 -> 409 expired_base_version（3 月已有 r1） -
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end":   "2027-01-01T00:00:00Z",
+        "items": [
+          {"number": "SOP-PRE-001", "base_revision": 0,
+           "valid_start": "2026-03-10T00:00:00Z",
+           "valid_end":   "2026-03-20T00:00:00Z",
+           "body": "依据旧版 r0 的已覆盖区间，过期基版。"}
+        ]
+      }'; echo
+
+# --- 37a. 空作业区间 -> 422 invalid_interval（只读、不写历史） ------------
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "work_start": "2026-05-01T00:00:00Z",
+        "work_end":   "2026-05-01T00:00:00Z",
+        "items": [
+          {"number": "SOP-PRE-001", "base_revision": 0,
+           "valid_start": "2026-11-01T00:00:00Z",
+           "valid_end":   "2026-12-01T00:00:00Z", "body": "x"}
+        ]
+      }'; echo
+
+# --- 37b. 缺少作业区间字段 / 回填 published_at -> 422 validation_error ----
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "items": [
+          {"number": "SOP-PRE-001", "base_revision": 0,
+           "valid_start": "2026-11-01T00:00:00Z",
+           "valid_end":   "2026-12-01T00:00:00Z", "body": "x"}
+        ]
+      }'; echo

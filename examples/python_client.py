@@ -128,6 +128,142 @@ def main() -> None:
     # 13) 跨时段前置规程清单：逐片段判断全作业区间的持续可用性
     _closure_plan_examples()
 
+    # 14) 更正批量预演（本轮新增）：只读，不落库、不占版本号
+    _correction_preview_examples()
+
+
+def _correction_preview_examples() -> None:
+    """更正批量预演：提交前预演整批结果，只读、不写版本、不占版本号。"""
+    root = "SOP-DEMO-PREVIEW-001"
+    other = "SOP-DEMO-PREVIEW-002"
+
+    call("POST", "/api/v1/releases", {
+        "number": root,
+        "body": "根规程初版：进入车间必须佩戴护目镜。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-DEMO-PRE-101"],   # 已在 12 步发布
+    })
+    call("POST", "/api/v1/releases", {
+        "number": other,
+        "body": "另一规程初版：动火作业须办理动火证。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+    })
+
+    # 14.1) 批量预演：先 r0->r1（3 月），再以同批拟生成的 r1 为基版 r1->r2
+    #       （3 月 10-20 日）；另一规程 5 月更正并显式清空前置。
+    status, res = call("POST", "/api/v1/corrections/preview", {
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+        "items": [
+            {"number": root, "base_revision": 0,
+             "valid_start": "2026-03-01T00:00:00Z",
+             "valid_end": "2026-04-01T00:00:00Z",
+             "body": "三月更正：检修期加派监护。"},                # 省略 -> 继承前置
+            {"number": root, "base_revision": 1,
+             "valid_start": "2026-03-10T00:00:00Z",
+             "valid_end": "2026-03-20T00:00:00Z",
+             "body": "对拟生成 r1 的再更正：全套防割装备。"},      # 后项引用前项
+            {"number": other, "base_revision": 0,
+             "valid_start": "2026-05-01T00:00:00Z",
+             "valid_end": "2026-06-01T00:00:00Z",
+             "body": "五月更正。", "prerequisites": []},           # 显式清空
+        ],
+    })
+    show("14.1 批量预演（拟生成版本号 + 最终前置清单 + 提交前后最大片段）",
+         status, res)
+
+    # 14.2) 预演只读：版本历史仍只有 r0，版本号未被预演占用
+    status, hist = call("GET", f"/api/v1/procedures/{root}/history")
+    show("14.2 预演后历史不变（仍只有 r0，r1/r2 未占用）", status,
+         [v["revision"] for v in hist["items"]])
+
+    # 14.3) 单条对象形式：作业区间随条目一起给出
+    status, res = call("POST", "/api/v1/corrections/preview", {
+        "number": root, "base_revision": 0,
+        "valid_start": "2026-07-01T00:00:00Z",
+        "valid_end": "2026-08-01T00:00:00Z",
+        "body": "七月更正。",
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+    })
+    show("14.3 单条对象形式预演", status, res)
+
+    # 14.4) 任一项非法：指出位置（details.index=1）与现有错误原因，不返回部分结果
+    status, res = call("POST", "/api/v1/corrections/preview", {
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+        "items": [
+            {"number": root, "base_revision": 0,
+             "valid_start": "2026-09-01T00:00:00Z",
+             "valid_end": "2026-10-01T00:00:00Z", "body": "第 1 条合法"},
+            {"number": "SOP-DEMO-PREVIEW-GONE", "base_revision": 0,
+             "valid_start": "2026-09-01T00:00:00Z",
+             "valid_end": "2026-10-01T00:00:00Z", "body": "第 2 条编号不存在"},
+        ],
+    })
+    show("14.4a 第 2 条编号不存在 -> 404 not_found（index=1）", status, res)
+
+    # 14.5) 同批对同一基版的子区间重叠 -> 409，与正式提交同码同因
+    status, res = call("POST", "/api/v1/corrections/preview", {
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+        "items": [
+            {"number": root, "base_revision": 0,
+             "valid_start": "2026-09-01T00:00:00Z",
+             "valid_end": "2026-09-20T00:00:00Z", "body": "并发更正 A"},
+            {"number": root, "base_revision": 0,
+             "valid_start": "2026-09-10T00:00:00Z",
+             "valid_end": "2026-09-30T00:00:00Z", "body": "并发更正 B（冲突）"},
+        ],
+    })
+    show("14.4b 同批重叠 -> 409 concurrent_correction_conflict（index=1）",
+         status, res)
+
+    # 14.6) 非法作业区间 / 缺字段 / 回填发布时刻
+    status, res = call("POST", "/api/v1/corrections/preview", {
+        "work_start": "2026-05-01T00:00:00Z",
+        "work_end": "2026-05-01T00:00:00Z",
+        "items": [{"number": root, "base_revision": 0,
+                   "valid_start": "2026-09-01T00:00:00Z",
+                   "valid_end": "2026-10-01T00:00:00Z", "body": "x"}]})
+    show("14.5a 空作业区间 -> 422 invalid_interval", status, res)
+    status, res = call("POST", "/api/v1/corrections/preview", {
+        "items": [{"number": root, "base_revision": 0,
+                   "valid_start": "2026-09-01T00:00:00Z",
+                   "valid_end": "2026-10-01T00:00:00Z", "body": "x"}]})
+    show("14.5b 缺少作业区间字段 -> 422 validation_error", status, res)
+    status, res = call("POST", "/api/v1/corrections/preview", {
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+        "items": [{"number": root, "base_revision": 0,
+                   "valid_start": "2026-09-01T00:00:00Z",
+                   "valid_end": "2026-10-01T00:00:00Z", "body": "x",
+                   "published_at": "2000-01-01T00:00:00Z"}]})
+    show("14.5c 回填发布时刻（额外字段）-> 422 validation_error", status, res)
+
+    # 14.7) 预演结果不保证可提交：先对一个空闲区间预演成功，随后他人抢先
+    #       占用同一区间，正式提交仍按提交时状态重新校验而失败。
+    win = {"valid_start": "2026-11-01T00:00:00Z",
+           "valid_end": "2026-12-01T00:00:00Z"}
+    status, preview = call("POST", "/api/v1/corrections/preview", {
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+        "items": [{"number": root, "base_revision": 0, **win,
+                   "body": "预演时该区间空闲，拟生成新版本。"}]})
+    show("14.6a 预演成功（拟生成版本号，只反映预演当时快照）", status,
+         {"revision": preview["items"][0]["revision"]} if status == 200 else preview)
+    call("POST", "/api/v1/corrections", {
+        "number": root, "base_revision": 0, **win,
+        "body": "他人抢先发布的十一月更正。"})
+    status, res = call("POST", "/api/v1/corrections", {
+        "number": root, "base_revision": 0, **win,
+        "body": "与预演相同的载荷；正式提交时该区间已被占用。"})
+    show("14.6b 正式提交仍按当时状态校验 -> 409 expired_base_version",
+         status, res)
+
+
 
 def _withdrawal_examples() -> None:
     """撤回示例：撤回只追加事件，撤回前历史不变，撤回后区间恢复父版本正文。"""

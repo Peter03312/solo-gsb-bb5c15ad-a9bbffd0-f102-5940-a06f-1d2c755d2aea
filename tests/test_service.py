@@ -1569,6 +1569,211 @@ class ClosurePlanTests(unittest.TestCase):
         self.assertEqual(service.list_history("PL-E3"), before)
 
 
+def pitem(number: str, base: int, start: str, end: str, body: str = "预演更正",
+          prerequisites=None):
+    return item(number, body, start, end, base, prerequisites=prerequisites)
+
+
+class CorrectionPreviewTests(unittest.TestCase):
+    """更正批量预演：只读、不占版本号；校验与正式提交逐项一致。"""
+
+    def setUp(self):
+        reset_db()
+        release("PV-1", body="初版-1", prerequisites=["PV-PRE"])
+        release("PV-2", body="初版-2")
+
+    def _preview(self, items, start=t1, end=t5):
+        return service.preview_corrections(items, start, end)
+
+    def test_single_preview_predicts_revision_and_segment(self):
+        res = self._preview([pitem("PV-1", 0, t2, t3, "三月版")])
+        self.assertEqual(res["count"], 1)
+        it = res["items"][0]
+        self.assertEqual(it["index"], 0)
+        self.assertEqual(it["revision"], 1)
+        self.assertEqual(it["supersedes_revision"], 0)
+        self.assertEqual(it["prerequisites"], ["PV-PRE"])     # 省略继承
+        self.assertNotIn("published_at", it)
+        ch = res["changes"][0]
+        self.assertEqual(ch["number"], "PV-1")
+        self.assertEqual(ch["count"], 1)
+        seg = ch["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (canon(t2), canon(t3)))
+        self.assertEqual(seg["before"], {"revision": 0, "body": "初版-1"})
+        self.assertEqual(seg["after"], {"revision": 1, "body": "三月版"})
+
+    def test_preview_does_not_write_or_consume_revision(self):
+        before = service.list_history("PV-1")
+        self._preview([pitem("PV-1", 0, t2, t3, "三月版")])
+        self.assertEqual(service.list_history("PV-1"), before)
+        # 正式提交拿到的版本号仍是 1（预演未占用）
+        committed = correct("PV-1", 0, t2, t3, "正式三月版")
+        self.assertEqual(committed["items"][0]["revision"], 1)
+
+    def test_batch_applied_in_input_order_later_references_earlier(self):
+        res = self._preview([
+            pitem("PV-1", 0, t2, t3, "r1"),
+            pitem("PV-1", 1, iso(_T + timedelta(days=33)),
+                  iso(_T + timedelta(days=40)), "r2"),
+        ])
+        self.assertEqual([(x["index"], x["revision"], x["supersedes_revision"])
+                          for x in res["items"]],
+                         [(0, 1, 0), (1, 2, 1)])
+        # 3 月子区间被切成 r1 / r2 / r1 三段，两侧版本不同
+        sides = [(s["before"]["revision"], s["after"]["revision"])
+                 for s in res["changes"][0]["segments"]]
+        self.assertEqual(sides, [(0, 1), (0, 2), (0, 1)])
+
+    def test_chained_preview_revision_starts_after_existing_max(self):
+        correct("PV-1", 0, t2, t3, "已发布 r1")
+        res = self._preview([pitem("PV-1", 0, t3, t4, "下一条")])
+        self.assertEqual(res["items"][0]["revision"], 2)
+
+    def test_multiple_procedures_changes_in_first_appearance_order(self):
+        res = self._preview([
+            pitem("PV-2", 0, t3, t4, "PV-2 更正"),
+            pitem("PV-1", 0, t2, t3, "PV-1 更正"),
+        ])
+        self.assertEqual([c["number"] for c in res["changes"]],
+                         ["PV-2", "PV-1"])
+
+    def test_no_change_outside_work_window(self):
+        # 更正落在 3 月；只问 6-7 月作业区间 -> changes 为空但仍返回拟生成版本
+        res = self._preview([pitem("PV-1", 0, t2, t3, "三月")],
+                            start=iso(_T + timedelta(days=150)),
+                            end=iso(_T + timedelta(days=180)))
+        self.assertEqual(res["items"][0]["revision"], 1)
+        self.assertEqual(res["changes"][0]["count"], 0)
+        self.assertEqual(res["changes"][0]["segments"], [])
+
+    def test_segments_clipped_to_work_window(self):
+        res = self._preview([pitem("PV-1", 0, t2, t4, "跨段更正")],
+                            start=t3, end=t4)
+        segs = res["changes"][0]["segments"]
+        self.assertEqual(len(segs), 1)
+        self.assertEqual((segs[0]["start"], segs[0]["end"]),
+                         (canon(t3), canon(t4)))
+
+    def test_prerequisites_inherit_clear_and_replace(self):
+        inherited = self._preview([pitem("PV-1", 0, t3, t4, "x")])
+        self.assertEqual(inherited["items"][0]["prerequisites"], ["PV-PRE"])
+        cleared = self._preview(
+            [pitem("PV-1", 0, t3, t4, "x", prerequisites=[])])
+        self.assertEqual(cleared["items"][0]["prerequisites"], [])
+        replaced = self._preview(
+            [pitem("PV-1", 0, t3, t4, "x",
+                   prerequisites=["PV-PRE", "PV-OTHER"])])
+        self.assertEqual(replaced["items"][0]["prerequisites"],
+                         ["PV-PRE", "PV-OTHER"])
+
+    def test_error_missing_procedure_with_index(self):
+        with self.assertRaises(DomainError) as ctx:
+            self._preview([pitem("PV-1", 0, t3, t4, "ok"),
+                           pitem("PV-NOPE", 0, t3, t4, "bad")])
+        self.assertEqual(ctx.exception.code, "not_found")
+        self.assertEqual(ctx.exception.http_status, 404)
+        self.assertEqual(ctx.exception.details["index"], 1)
+
+    def test_error_base_version_not_found(self):
+        with self.assertRaises(DomainError) as ctx:
+            self._preview([pitem("PV-1", 7, t3, t4, "x")])
+        self.assertEqual(ctx.exception.code, "base_version_not_found")
+        self.assertEqual(ctx.exception.http_status, 404)
+
+    def test_error_interval_outside_base(self):
+        with self.assertRaises(DomainError) as ctx:
+            self._preview([pitem("PV-1", 0, t2, future, "x")])
+        self.assertEqual(ctx.exception.code, "invalid_interval")
+
+    def test_error_expired_base_version(self):
+        correct("PV-1", 0, t2, t3, "已占用 3 月")
+        with self.assertRaises(DomainError) as ctx:
+            self._preview([pitem("PV-1", 0,
+                                 iso(_T + timedelta(days=25)),
+                                 iso(_T + timedelta(days=35)), "x")])
+        self.assertEqual(ctx.exception.code, "expired_base_version")
+        self.assertEqual(ctx.exception.http_status, 409)
+        self.assertIn("remaining_intervals", ctx.exception.details)
+
+    def test_error_concurrent_overlap_in_batch(self):
+        with self.assertRaises(DomainError) as ctx:
+            self._preview([
+                pitem("PV-1", 0, iso(_T + timedelta(days=120)),
+                      iso(_T + timedelta(days=140)), "A"),
+                pitem("PV-1", 0, iso(_T + timedelta(days=130)),
+                      iso(_T + timedelta(days=150)), "B"),
+            ])
+        self.assertEqual(ctx.exception.code,
+                         "concurrent_correction_conflict")
+        self.assertEqual(ctx.exception.details["index"], 1)
+
+    def test_error_withdrawn_base(self):
+        correct("PV-1", 0, t2, t3, "误发布")
+        withdraw("PV-1", 1)
+        with self.assertRaises(DomainError) as ctx:
+            self._preview([pitem("PV-1", 1,
+                                 iso(_T + timedelta(days=33)),
+                                 iso(_T + timedelta(days=35)), "x")])
+        self.assertEqual(ctx.exception.code, "base_version_withdrawn")
+
+    def test_error_blank_and_duplicate_prerequisite(self):
+        with self.assertRaises(DomainError) as ctx:
+            self._preview([pitem("PV-1", 0, t3, t4, "x",
+                                 prerequisites=["  "])])
+        self.assertEqual(ctx.exception.code, "invalid_number")
+        with self.assertRaises(DomainError) as ctx:
+            self._preview([pitem("PV-1", 0, t3, t4, "x",
+                                 prerequisites=["Q", "Q"])])
+        self.assertEqual(ctx.exception.code,
+                         "duplicate_prerequisite_number")
+
+    def test_error_invalid_work_window_and_time(self):
+        with self.assertRaises(DomainError) as ctx:
+            self._preview([pitem("PV-1", 0, t3, t4, "x")],
+                          start=t4, end=t4)
+        self.assertEqual(ctx.exception.code, "invalid_interval")
+        with self.assertRaises(DomainError) as ctx:
+            self._preview([pitem("PV-1", 0, t3, t4, "x")],
+                          start="2026-01-01T00:00:00", end=t5)
+        self.assertEqual(ctx.exception.code, "invalid_time")
+
+    def test_error_is_read_only(self):
+        before = service.list_history("PV-1")
+        with self.assertRaises(DomainError):
+            self._preview([pitem("PV-1", 0, t2, t3, "ok"),
+                           pitem("PV-1", 0,
+                                 iso(_T + timedelta(days=25)),
+                                 iso(_T + timedelta(days=35)), "overlap")])
+        self.assertEqual(service.list_history("PV-1"), before)
+
+    def test_error_matches_actual_submit(self):
+        """预演拒绝的批次，正式提交也拒绝且错误码一致（反之亦然）。"""
+        items = [pitem("PV-1", 0,
+                       iso(_T + timedelta(days=120)),
+                       iso(_T + timedelta(days=140)), "A"),
+                 pitem("PV-1", 0,
+                       iso(_T + timedelta(days=130)),
+                       iso(_T + timedelta(days=150)), "B")]
+        with self.assertRaises(DomainError) as pv:
+            self._preview(items)
+        with self.assertRaises(DomainError) as sub:
+            service.submit_corrections(items)
+        self.assertEqual(pv.exception.code, sub.exception.code)
+        self.assertEqual(pv.exception.details.get("index"),
+                         sub.exception.details.get("index"))
+
+    def test_preview_then_later_concurrent_change_not_committable(self):
+        """预演结果不保证可提交：预演后历史变化，正式提交按当时状态重新校验。"""
+        items = [pitem("PV-1", 0, t2, t3, "预演时合法")]
+        # 预演时基版剩余区间充足
+        self.assertEqual(self._preview(items)["items"][0]["revision"], 1)
+        # 另一值班员先提交了同一区间的更正
+        correct("PV-1", 0, t2, t3, "抢先发布")
+        with self.assertRaises(DomainError) as ctx:
+            service.submit_corrections(items)
+        self.assertEqual(ctx.exception.code, "expired_base_version")
+
+
 class ApiTests(unittest.TestCase):
     """FastAPI 层：仅在依赖可用时运行。"""
 
@@ -2190,6 +2395,131 @@ class ApiTests(unittest.TestCase):
         # 错误不写历史
         self.assertEqual(c.get(f"/api/v1/procedures/{n}/history")
                          .json()["count"], 1)
+
+    def test_correction_preview_over_http(self):
+        c = self.client
+        n = self._n()
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "初版", "valid_start": t1, "valid_end": t5,
+            "prerequisites": ["PRE-X"]})
+
+        # 批量预演：同批先 r0->r1（3 月），再 r1->r2（3 月 10-20 日）
+        r = c.post("/api/v1/corrections/preview", json={
+            "work_start": t1, "work_end": t5,
+            "items": [
+                {"number": n, "base_revision": 0,
+                 "valid_start": t2, "valid_end": t3, "body": "三月"},
+                {"number": n, "base_revision": 1,
+                 "valid_start": iso(_T + timedelta(days=33)),
+                 "valid_end": iso(_T + timedelta(days=40)),
+                 "body": "三月再更正"}]})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["count"], 2)
+        self.assertEqual([(x["index"], x["revision"]) for x in body["items"]],
+                         [(0, 1), (1, 2)])
+        # 省略继承被替代版本前置
+        self.assertEqual(body["items"][0]["prerequisites"], ["PRE-X"])
+        self.assertEqual(body["items"][1]["prerequisites"], ["PRE-X"])
+        sides = [(s["before"]["revision"], s["after"]["revision"])
+                 for s in body["changes"][0]["segments"]]
+        self.assertEqual(sides, [(0, 1), (0, 2), (0, 1)])
+        for key in ("work_start", "work_end", "known_as_of"):
+            self.assertIn(key, body)
+
+        # 预演不写历史：仍只有 r0，正式提交拿到 r1
+        self.assertEqual(c.get(f"/api/v1/procedures/{n}/history")
+                         .json()["items"][-1]["revision"], 0)
+
+        # 单条对象形式（作业区间随条目给出）
+        r = c.post("/api/v1/corrections/preview", json={
+            "number": n, "base_revision": 0,
+            "valid_start": t3, "valid_end": t4, "body": "四月",
+            "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["items"][0]["revision"], 1)
+        self.assertEqual(body["changes"][0]["segments"][0]["after"],
+                         {"revision": 1, "body": "四月"})
+        self.assertEqual(c.get(f"/api/v1/procedures/{n}/history")
+                         .json()["items"][-1]["revision"], 0)
+
+    def test_correction_preview_errors_over_http(self):
+        c = self.client
+        n = self._n()
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "初版", "valid_start": t1, "valid_end": t5})
+
+        # 同批并发更正冲突 -> 409，details.index 指出出错位置（第 2 条）
+        r = c.post("/api/v1/corrections/preview", json={
+            "work_start": t1, "work_end": t5,
+            "items": [
+                {"number": n, "base_revision": 0,
+                 "valid_start": iso(_T + timedelta(days=120)),
+                 "valid_end": iso(_T + timedelta(days=140)), "body": "A"},
+                {"number": n, "base_revision": 0,
+                 "valid_start": iso(_T + timedelta(days=130)),
+                 "valid_end": iso(_T + timedelta(days=150)),
+                 "body": "B(冲突)"}]})
+        self.assertEqual(r.status_code, 409)
+        err = r.json()["error"]
+        self.assertEqual(err["code"], "concurrent_correction_conflict")
+        self.assertEqual(err["details"]["index"], 1)
+
+        # 过期基版（占用 3 月的更正已发布）-> 409 expired_base_version，
+        # 错误原因与正式提交一致且带 remaining_intervals
+        c.post("/api/v1/corrections", json={
+            "number": n, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "已发布"})
+        r = c.post("/api/v1/corrections/preview", json={
+            "work_start": t1, "work_end": t5,
+            "items": [{"number": n, "base_revision": 0,
+                       "valid_start": iso(_T + timedelta(days=25)),
+                       "valid_end": iso(_T + timedelta(days=35)),
+                       "body": "落在已覆盖处"}]})
+        self.assertEqual(r.status_code, 409)
+        err = r.json()["error"]
+        self.assertEqual(err["code"], "expired_base_version")
+        self.assertIn("remaining_intervals", err["details"])
+
+        # 编号不存在 -> 404 not_found
+        r = c.post("/api/v1/corrections/preview", json={
+            "work_start": t1, "work_end": t5,
+            "items": [{"number": "NO-SUCH-PV", "base_revision": 0,
+                       "valid_start": t2, "valid_end": t3, "body": "x"}]})
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "not_found")
+
+        # 空作业区间 -> 422 invalid_interval
+        r = c.post("/api/v1/corrections/preview", json={
+            "work_start": t2, "work_end": t2,
+            "items": [{"number": n, "base_revision": 0,
+                       "valid_start": t3, "valid_end": t4, "body": "x"}]})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_interval")
+
+        # 缺少作业区间字段 -> 422 validation_error
+        r = c.post("/api/v1/corrections/preview", json={
+            "items": [{"number": n, "base_revision": 0,
+                       "valid_start": t3, "valid_end": t4, "body": "x"}]})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "validation_error")
+
+        # 额外字段（如回填发布时刻）-> 422 validation_error
+        r = c.post("/api/v1/corrections/preview", json={
+            "work_start": t1, "work_end": t5,
+            "items": [{"number": n, "base_revision": 0,
+                       "valid_start": t3, "valid_end": t4, "body": "x",
+                       "published_at": t1}]})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "validation_error")
+
+        # 全程只读：本用例仅正式提交过 1 条更正（r0、r1 共 2 行），预演不增加
+        self.assertEqual(c.get(f"/api/v1/procedures/{n}/history")
+                         .json()["count"], 2)
+        self.assertEqual(c.get(f"/api/v1/procedures/{n}/history")
+                         .json()["items"][-1]["revision"], 1)
 
 
 if __name__ == "__main__":

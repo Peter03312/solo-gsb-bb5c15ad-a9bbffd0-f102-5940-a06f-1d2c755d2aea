@@ -44,6 +44,19 @@ class CorrectionBatch(StrictModel):
     items: list[CorrectionItem]
 
 
+class CorrectionPreviewItem(CorrectionItem):
+    """单条预演：字段与更正条目完全一致，另须指定非空作业区间。"""
+    work_start: str = Field(..., description="预演作业区间起点（含），ISO-8601 带时区")
+    work_end: str = Field(..., description="预演作业区间终点（不含），必须严格晚于起点")
+
+
+class CorrectionPreviewBatch(StrictModel):
+    """批量预演：更正条目（与 /corrections 批量完全一致）+ 非空作业区间。"""
+    work_start: str = Field(..., description="预演作业区间起点（含），ISO-8601 带时区")
+    work_end: str = Field(..., description="预演作业区间终点（不含），必须严格晚于起点")
+    items: list[CorrectionItem]
+
+
 class WithdrawalItem(StrictModel):
     number: str = Field(..., description="规程编号")
     revision: int = Field(..., ge=0, description="待撤回的更正版本号（首版 0 不可撤回）")

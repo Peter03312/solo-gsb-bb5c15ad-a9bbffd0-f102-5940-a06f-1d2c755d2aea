@@ -61,6 +61,26 @@
   在同一只读快照内收集根及递归可引用规程的可见版本端点切分区间，逐片段
   复用闭包解析；片段解析器对缺口/环不抛异常而保留片段（部分前置清单 +
   缺口链/环路径），相邻片段仅在清单与错误状态完全相同时合并。
+
+更正批量预演
+------------
+值班员在正式提交多条更正前，可先按"现有单条/批量更正的同一套字段与校验"
+预演整批结果（preview_corrections）：
+
+- 必须指定一个非空作业区间 ``[work_start, work_end)``；预演在**同一只读
+  快照**上把当时数据完整复制进一个内存库，随后在该副本上运行与正式提交
+  **逐行相同**的应用逻辑（``_apply_corrections``）——同批条目按输入顺序
+  生效，后项可引用前项在副本内拟生成的版本；
+- 逐项沿用当前基版剩余区间、同批重叠、正文非空及前置编号的校验与"省略
+  继承 / 显式清空"规则；任一项非法即抛出与正式提交**完全相同**的领域错误
+  （含 ``details.index`` 指明位置），不返回任何部分成功结果；
+- 全部合法时返回各项拟生成版本号与最终前置清单，以及指定作业区间内
+  "提交前（当前快照）"与"提交后（应用本批之后）"实际适用版本不同的
+  **最大片段**（片段两侧各为 ``{revision, body}`` 或 ``null``，仅版本号
+  不同即为变化，边界切分与合并沿用两知悉时刻对比的约定）；
+- 预演**全程只读**：不写版本、不占版本号、不推进服务端时钟、不改变历史
+  （连正式提交与预演共用的应用逻辑也跑在副本上）；正式提交仍须按提交时
+  的当时状态重新校验，预演结果不保证可提交。
 """
 from __future__ import annotations
 
@@ -357,83 +377,265 @@ def submit_corrections(items: list) -> dict:
     """
     with write_tx() as conn:
         published_at = _server_now()
-        # (proc_id, base_revision) -> 本批次内已占用的子区间
-        pending: dict[tuple[int, int], list[tuple[str, str]]] = {}
-        created: list[dict] = []
-
-        for i, item in enumerate(items):
-            number = _clean_number(item.number, i)
-            body = _clean_text(item.body, "body", i)
-            sub = _validated_interval(item.valid_start, item.valid_end, i)
-            # 省略 -> 继承被替代版本的前置列表；显式空列表 -> 清空
-            prerequisites = _clean_prerequisites(
-                getattr(item, "prerequisites", None), i)
-
-            proc = _fetch_procedure(conn, number)
-            if proc is None:
-                raise errors.procedure_not_found(number, i)
-            proc_id = proc["id"]
-            base = _fetch_version(conn, proc_id, item.base_revision)
-            if base is None:
-                raise errors.base_version_not_found(number, item.base_revision, i)
-
-            # 1) 子区间必须整体落在基版区间内（非法区间优先于冲突判定）。
-            base_iv = (base["valid_start"], base["valid_end"])
-            if not (base_iv[0] <= sub[0] and sub[1] <= base_iv[1]):
-                raise errors.invalid_interval(
-                    sub[0], sub[1],
-                    f"非法区间：更正子区间 [{sub[0]}, {sub[1]}) 超出被替代版本 "
-                    f"r{item.base_revision} 的适用区间 [{base_iv[0]}, {base_iv[1]})",
-                    i)
-
-            # 1.5) 已撤回版本不再是任何更正的基版：其区间已恢复由父版本持有，
-            #      若要改正文请改以父版本（当前生效版本）为被替代版本。
-            base_withdrawn_at = _withdrawn_at(conn, base["id"])
-            if base_withdrawn_at is not None:
-                raise errors.base_version_withdrawn(
-                    number, item.base_revision, base_withdrawn_at, i)
-
-            # 2) 同一被替代版本的并发更正不得在生效区间上相互冲突。
-            #    先于"剩余区间"检查：同批次更早条目虽已插入当前事务、
-            #    尚非已发布历史，对它们的重叠属于并发更正，而非过期基版。
-            key = (proc_id, item.base_revision)
-            clash = _first_overlap(sub, pending.get(key, []))
-            if clash is not None:
-                raise errors.concurrent_conflict(number, item.base_revision,
-                                                 clash, i)
-
-            # 3) 扣除已发布子更正后的剩余生效区间；子区间不落在其中 -> 过期基版。
-            #    （步骤 1 已保证子区间在基版区间内，故未被剩余区间覆盖的部分
-            #    必然与某个已发布子更正重叠，即客户依据的是已被替代的旧版。）
-            remaining = _remaining(conn, base)
-            if not _covered_by(sub, remaining):
-                raise errors.expired_base(number, item.base_revision, remaining, i)
-
-            row = conn.execute(
-                "SELECT COALESCE(MAX(revision), -1) + 1 AS next_revision "
-                "FROM versions WHERE procedure_id = ?", (proc_id,)).fetchone()
-            new_revision = row["next_revision"]
-
-            # 省略时继承被替代版本的前置列表：基版行不可变，写入时复制与
-            # 按引用继承完全等价，且保持"只追加、不改写历史"。
-            if prerequisites is None:
-                prerequisites = _prerequisites_of(conn, base["id"])
-
-            cur = conn.execute(
-                "INSERT INTO versions (procedure_id, revision, body, "
-                "valid_start, valid_end, supersedes_id, published_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (proc_id, new_revision, body, sub[0], sub[1],
-                 base["id"], published_at))
-            _insert_prerequisites(conn, cur.lastrowid, prerequisites)
-            pending.setdefault(key, []).append(sub)
-            created.append({"number": number, "revision": new_revision,
-                            "supersedes_revision": item.base_revision,
-                            "body": body, "valid_start": sub[0],
-                            "valid_end": sub[1], "published_at": published_at,
-                            "prerequisites": prerequisites})
-
+        applied = _apply_corrections(conn, items, published_at)
+    # 正式提交的响应形状保持不变：每项回填服务端发布时刻、不带预演用的 index。
+    created = [{k: v for k, v in entry.items() if k != "index"}
+               | {"published_at": published_at}
+              for entry in applied]
     return {"published_at": published_at, "items": created}
+
+
+def _apply_corrections(conn: sqlite3.Connection, items: list,
+                       published_at: str) -> list[dict]:
+    """在给定连接/事务上按输入顺序逐条应用更正，返回拟/已生成版本清单。
+
+    正式提交与批量预演共用**完全相同**的本函数，保证预演沿用与单条/批量
+    更正一致的全部校验（剩余区间、同批重叠、正文、前置编号及省略继承/显式
+    清空）；预演调用方传入的是只读快照的内存副本，故即使本函数含 INSERT
+    也不会写真实历史、不占真实版本号。调用方负责外层事务（异常即整体回滚）。
+    """
+    # (proc_id, base_revision) -> 本批次内已占用的子区间
+    pending: dict[tuple[int, int], list[tuple[str, str]]] = {}
+    created: list[dict] = []
+
+    for i, item in enumerate(items):
+        number = _clean_number(item.number, i)
+        body = _clean_text(item.body, "body", i)
+        sub = _validated_interval(item.valid_start, item.valid_end, i)
+        # 省略 -> 继承被替代版本的前置列表；显式空列表 -> 清空
+        prerequisites = _clean_prerequisites(
+            getattr(item, "prerequisites", None), i)
+
+        proc = _fetch_procedure(conn, number)
+        if proc is None:
+            raise errors.procedure_not_found(number, i)
+        proc_id = proc["id"]
+        base = _fetch_version(conn, proc_id, item.base_revision)
+        if base is None:
+            raise errors.base_version_not_found(number, item.base_revision, i)
+
+        # 1) 子区间必须整体落在基版区间内（非法区间优先于冲突判定）。
+        base_iv = (base["valid_start"], base["valid_end"])
+        if not (base_iv[0] <= sub[0] and sub[1] <= base_iv[1]):
+            raise errors.invalid_interval(
+                sub[0], sub[1],
+                f"非法区间：更正子区间 [{sub[0]}, {sub[1]}) 超出被替代版本 "
+                f"r{item.base_revision} 的适用区间 [{base_iv[0]}, {base_iv[1]})",
+                i)
+
+        # 1.5) 已撤回版本不再是任何更正的基版：其区间已恢复由父版本持有，
+        #      若要改正文请改以父版本（当前生效版本）为被替代版本。
+        base_withdrawn_at = _withdrawn_at(conn, base["id"])
+        if base_withdrawn_at is not None:
+            raise errors.base_version_withdrawn(
+                number, item.base_revision, base_withdrawn_at, i)
+
+        # 2) 同一被替代版本的并发更正不得在生效区间上相互冲突。
+        #    先于"剩余区间"检查：同批次更早条目虽已插入当前事务、
+        #    尚非已发布历史，对它们的重叠属于并发更正，而非过期基版。
+        key = (proc_id, item.base_revision)
+        clash = _first_overlap(sub, pending.get(key, []))
+        if clash is not None:
+            raise errors.concurrent_conflict(number, item.base_revision,
+                                             clash, i)
+
+        # 3) 扣除已发布子更正后的剩余生效区间；子区间不落在其中 -> 过期基版。
+        #    （步骤 1 已保证子区间在基版区间内，故未被剩余区间覆盖的部分
+        #    必然与某个已发布子更正重叠，即客户依据的是已被替代的旧版。）
+        remaining = _remaining(conn, base)
+        if not _covered_by(sub, remaining):
+            raise errors.expired_base(number, item.base_revision, remaining, i)
+
+        row = conn.execute(
+            "SELECT COALESCE(MAX(revision), -1) + 1 AS next_revision "
+            "FROM versions WHERE procedure_id = ?", (proc_id,)).fetchone()
+        new_revision = row["next_revision"]
+
+        # 省略时继承被替代版本的前置列表：基版行不可变，写入时复制与
+        # 按引用继承完全等价，且保持"只追加、不改写历史"。
+        if prerequisites is None:
+            prerequisites = _prerequisites_of(conn, base["id"])
+
+        cur = conn.execute(
+            "INSERT INTO versions (procedure_id, revision, body, "
+            "valid_start, valid_end, supersedes_id, published_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (proc_id, new_revision, body, sub[0], sub[1],
+             base["id"], published_at))
+        _insert_prerequisites(conn, cur.lastrowid, prerequisites)
+        pending.setdefault(key, []).append(sub)
+        created.append({"index": i, "number": number, "revision": new_revision,
+                        "supersedes_revision": item.base_revision,
+                        "body": body, "valid_start": sub[0],
+                        "valid_end": sub[1], "prerequisites": prerequisites})
+    return created
+
+# ---------------------------------------------------------------- 更正批量预演
+
+
+def preview_corrections(items: list, work_start_raw: str,
+                        work_end_raw: str) -> dict:
+    """正式提交前预演一批更正：只读，不写版本、不占版本号、不改变历史。
+
+    入参与 ``POST /api/v1/corrections`` 完全一致（同样支持单条对象/批量），
+    另须指定一个**非空作业区间** ``[work_start, work_end)``。预演在同一只读
+    快照的内存副本上运行与正式提交逐行相同的 :func:`_apply_corrections`：
+    同批条目按输入顺序应用，后项可引用前项拟生成的版本；逐项沿用当前基版
+    剩余区间、同批重叠、正文及前置编号（省略继承 / 显式清空）的校验。
+
+    全部合法时返回：
+
+    * ``items``：各项（按输入顺序，带 ``index``）拟生成的版本号 ``revision``
+      与最终前置清单 ``prerequisites``（及编号、基版、子区间、正文）；
+    * ``changes``：本批涉及的每个规程（按编号在输入中首次出现的顺序）在指定
+      作业区间内，提交前（当前快照）与提交后（应用本批之后）实际适用版本
+      不同的最大片段；片段两侧各为 ``{"revision", "body"}`` 或 ``null``，
+      是否变化只看版本号，切分/合并沿用两知悉时刻对比（第 6 节）的约定。
+
+    任一项非法则抛出与正式提交完全相同的领域错误（``details.index`` 指明
+    位置），不返回部分成功结果。预演不推进服务端单调时钟；随后正式提交仍须
+    按提交时的当时状态重新校验，预演结果不保证可提交。
+    """
+    try:
+        work_start = parse_canonical(work_start_raw, "work_start")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "work_start"})
+    try:
+        work_end = parse_canonical(work_end_raw, "work_end")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "work_end"})
+    if not work_start < work_end:
+        raise errors.invalid_interval(
+            work_start, work_end,
+            "作业区间非法：work_start 必须严格早于 work_end（区间为 [起, 止) 且长度大于 0）")
+
+    # 预演全程只读：取墙上时钟作为"提交前"快照基准（不触碰写路径的共享
+    # 单调状态，避免在只读事务内引入任何写侧副作用）。
+    known_as_of = now_canonical()
+    with read_snapshot() as snapshot:
+        sim = _in_memory_clone(snapshot)
+        try:
+            created = _apply_corrections(sim, items, known_as_of)
+
+            numbers: list[str] = []
+            seen: set[str] = set()
+            for entry in created:
+                if entry["number"] not in seen:
+                    seen.add(entry["number"])
+                    numbers.append(entry["number"])
+            changes = [
+                _preview_changes_for(snapshot, sim, number,
+                                     work_start, work_end, known_as_of)
+                for number in numbers]
+        finally:
+            sim.close()
+
+    return {"work_start": work_start, "work_end": work_end,
+            "known_as_of": known_as_of, "count": len(created),
+            "items": created, "changes": changes}
+
+
+def _in_memory_clone(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """把只读快照当时的全部业务表复制进一个全新的内存库（同 schema）。
+
+    预演在该副本上运行与正式提交逐行相同的应用逻辑，因此不写真实历史、
+    不占真实版本号；行主键连同 AUTOINCREMENT 序列（sqlite_sequence）一并
+    复制，保证副本内 ``lastrowid`` 与外键引用关系和真实库一致。
+    """
+    from .db import _SCHEMA
+
+    clone = sqlite3.connect(":memory:")
+    try:
+        clone.row_factory = sqlite3.Row
+        clone.execute("PRAGMA foreign_keys = OFF")
+        clone.executescript(_SCHEMA)
+        tables = ["procedures", "versions", "withdrawals", "packages",
+                  "package_items", "prerequisites"]
+        for table in tables:
+            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+            if not rows:
+                continue
+            columns = rows[0].keys()
+            placeholders = ",".join("?" * len(columns))
+            col_list = ",".join(columns)
+            clone.executemany(
+                f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})",
+                [tuple(r[c] for c in columns) for r in rows])
+        # 复制 AUTOINCREMENT 序列，副本内新行的 rowid 不与拷入行冲突。
+        # 源库从未向 AUTOINCREMENT 表插过行时 sqlite_sequence 表尚不存在。
+        if conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='sqlite_sequence'").fetchone():
+            seq_rows = conn.execute(
+                "SELECT name, seq FROM sqlite_sequence").fetchall()
+            for r in seq_rows:
+                clone.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+                    (r["name"], r["seq"]))
+        clone.commit()
+    except Exception:
+        clone.close()
+        raise
+    return clone
+
+
+def _preview_changes_for(before_conn: sqlite3.Connection,
+                         after_conn: sqlite3.Connection, number: str,
+                         work_start: str, work_end: str,
+                         known_as_of: str) -> dict:
+    """单个规程在作业区间内"提交前 vs 提交后（本批应用后）"的版本差异片段。
+
+    两侧均以预演时刻为知悉时刻（本批更正视为"此刻发布"）：提交前取只读
+    快照当时的可见版本，提交后取内存副本（含本批拟生成版本）的可见版本。
+    切分、合并与版本相等判定完全沿用两知悉时刻对比（compare_interval）。
+    """
+    proc = _fetch_procedure(before_conn, number)
+    proc_id = proc["id"]
+    before_rows = _visible_versions(before_conn, proc_id, known_as_of)
+    after_rows = _visible_versions(after_conn, proc_id, known_as_of)
+
+    # 片段解析需要沿完整 supersedes 链计算深度（含对某侧不可见的版本），
+    # 故按两侧并集建索引；版本 id 在各自库内唯一，而副本新生成的版本 id
+    # 在其所属规程下不与既有 id 相同，故并集内不会发生跨库键冲突。
+    all_rows = {v["id"]: v for v in before_rows}
+    for v in after_rows:
+        all_rows.setdefault(v["id"], v)
+    depth_cache: dict[int, int] = {}
+
+    bounds = {work_start, work_end}
+    for v in all_rows.values():
+        if v["valid_end"] <= work_start or work_end <= v["valid_start"]:
+            continue                        # 与作业区间不相交
+        bounds.add(max(v["valid_start"], work_start))
+        bounds.add(min(v["valid_end"], work_end))
+    ordered = sorted(bounds)
+
+    raw: list[tuple[str, str, int | None, int | None]] = []
+    for s, e in zip(ordered, ordered[1:]):
+        lv = _effective_at(s, before_rows, all_rows, depth_cache)
+        rv = _effective_at(s, after_rows, all_rows, depth_cache)
+        raw.append((s, e, lv["id"] if lv is not None else None,
+                    rv["id"] if rv is not None else None))
+
+    segments: list[dict] = []
+    for s, e, lid, rid in _merge_adjacent(raw):
+        if lid == rid:
+            continue
+        lv = all_rows.get(lid) if lid is not None else None
+        rv = all_rows.get(rid) if rid is not None else None
+        segments.append({
+            "start": s,
+            "end": e,
+            "before": None if lv is None else {
+                "revision": lv["revision"], "body": lv["body"]},
+            "after": None if rv is None else {
+                "revision": rv["revision"], "body": rv["body"]},
+        })
+
+    return {"number": number, "count": len(segments), "segments": segments}
+
 
 # ---------------------------------------------------------------- 更正撤回
 
